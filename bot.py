@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import logging
 import os
@@ -7,6 +6,7 @@ import re
 
 import aiohttp
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -143,10 +143,29 @@ def extract_tokens(text):
     return TOKEN_RE.findall(text or "")
 
 
-def as_file(text, name):
-    bio = io.BytesIO(text.encode("utf-8"))
-    bio.name = name
-    return bio
+def chunk_lines(lines, limit=3500):
+    """Split lines into groups that fit in one Telegram message."""
+    chunks, cur, size = [], [], 0
+    for line in lines:
+        if cur and size + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def send_block(message, title, tokens):
+    """Send tokens one per line inside a code block (tap = copy all)."""
+    if not tokens:
+        return
+    parts = chunk_lines(tokens)
+    for n, part in enumerate(parts, 1):
+        head = title if len(parts) == 1 else f"{title} [{n}/{len(parts)}]"
+        await message.reply_text(f"{head}\n<pre>{chr(10).join(part)}</pre>", parse_mode=ParseMode.HTML)
+        await asyncio.sleep(0.5)
 
 
 async def safe_edit(msg, text):
@@ -186,44 +205,34 @@ async def run_check(message, tokens):
     unknown = [r for r in valid if r["remaining"] is None]
     total_left = sum(r["remaining"] or 0 for r in valid)
 
-    lines = []
-    for i, r in enumerate(results, 1):
-        if r["status"] == "valid":
-            if r["remaining"] is not None and r["limit"] is not None:
-                info = f"used {r['count']}/{r['limit']} | left {r['remaining']}"
-            elif r["remaining"] == 0:
-                info = "left 0"
-            else:
-                info = "left ?"
-            extra = " | all: " + ", ".join(
-                f"{x.get('name')} {x.get('count')}/{x.get('limit')}" for x in r["all"]
-            ) if r["all"] else ""
-            lines.append(f"{i}. {mask(r['token'])} | VALID | {r['login']} | {info} | {r['note']}{extra}")
-        elif r["status"] == "invalid":
-            lines.append(f"{i}. {mask(r['token'])} | INVALID (removed)")
-        else:
-            lines.append(f"{i}. {mask(r['token'])} | ERROR (kept, retry) | {r['note']}")
+    main_tokens = [r["token"] for r in valid if r["remaining"] != 0]  # limit bachi hai ya unknown
+    exhausted_tokens = [r["token"] for r in exhausted]
+    error_tokens = [r["token"] for r in errors]
+    invalid_tokens = [r["token"] for r in invalid]
+    total_limit = sum(r["limit"] or 0 for r in valid)
 
+    await safe_edit(status, f"✅ Check complete — {len(results)} tokens")
+
+    # 1) valid tokens, one per line (paste-ready)
+    await send_block(message, f"✅ Valid tokens ({len(main_tokens)})", main_tokens)
+
+    # 2) totals below the tokens
     summary = (
-        f"✅ Check complete — {len(results)} tokens\n\n"
-        f"🟢 Valid: {len(valid)}\n"
-        f"🔴 Invalid (removed): {len(invalid)}\n"
-        f"🟡 Error (kept, dobara check karo): {len(errors)}\n\n"
-        f"📊 Limit bacha hai: {len(with_limit)}\n"
-        f"⛔ Limit khatam: {len(exhausted)}\n"
-        f"❔ Limit unknown: {len(unknown)}\n"
-        f"➕ Total remaining: {total_left}"
+        f"📊 Total limit: {total_limit}\n"
+        f"✅ Bachi hui: {total_left}\n"
+        f"⛔ Limit khatam: {len(exhausted)} tokens\n"
+        f"🟢 Valid: {len(valid)} | 🔴 Invalid: {len(invalid)}"
     )
-    await safe_edit(status, summary)
+    if unknown:
+        summary += f"\n❔ Limit unknown: {len(unknown)} tokens"
+    if errors:
+        summary += f"\n🟡 Error (dobara check karo): {len(errors)}"
+    await message.reply_text(summary)
 
-    cleaned = [r["token"] for r in results if r["status"] != "invalid"]
-    await message.reply_document(as_file("\n".join(cleaned), "cleaned_tokens.txt"),
-                                 caption="Invalid hata diye (error wale rakhe hain)")
-    if with_limit:
-        with_limit.sort(key=lambda r: r["remaining"], reverse=True)
-        await message.reply_document(as_file("\n".join(r["token"] for r in with_limit), "with_limit_tokens.txt"),
-                                     caption="Sirf wo jinme limit bachi hai (zyada se kam)")
-    await message.reply_document(as_file("\n".join(lines), "report.txt"), caption="Full report")
+    # 3) the rest, each in its own block
+    await send_block(message, f"⛔ Limit khatam ({len(exhausted_tokens)})", exhausted_tokens)
+    await send_block(message, f"🟡 Error — dobara check karo ({len(error_tokens)})", error_tokens)
+    await send_block(message, f"❌ Invalid tokens ({len(invalid_tokens)})", invalid_tokens)
 
 
 async def delayed_run(user_id):
@@ -256,7 +265,7 @@ async def start(_, message: Message):
     await message.reply_text(
         "👋 Bitly Limit Checker\n\n"
         "Bitly tokens bhejo (har line me ek token) — text ya .txt file, 150-200 ek saath chalega.\n"
-        "Main har token check karke bataunga kitni limit bachi hai, invalid hata dunga aur cleaned list file me dunga.\n\n"
+        "Main text me reply dunga: valid tokens (line se, paste-ready), niche total limit + bachi hui limit, phir invalid tokens.\n\n"
         "Debug: /raw <token> — us token ki saari plan limits dikhata hai."
     )
 
@@ -271,7 +280,7 @@ async def raw(_, message: Message):
     async with aiohttp.ClientSession() as session:
         r = await check_token(session, asyncio.Semaphore(1), toks[0])
     out = json.dumps({k: v for k, v in r.items() if k != "token"}, indent=2)
-    await message.reply_text(f"<pre>{out[:3800]}</pre>", parse_mode=__import__("pyrogram").enums.ParseMode.HTML)
+    await message.reply_text(f"<pre>{out[:3800]}</pre>", parse_mode=ParseMode.HTML)
 
 
 @app.on_message(filters.private & (filters.text | filters.document) & ~filters.command(["start", "raw"]))
