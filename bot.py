@@ -18,7 +18,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # Optional: comma/space separated Telegram user IDs. Empty = everyone can use the bot.
 ADMINS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMINS", "")) if x.lstrip("-").isdigit()}
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
-DEBOUNCE = 4  # seconds to wait for more messages before starting the check
+DEBOUNCE = 6  # seconds to wait for more messages before starting the check
+
+KEYS = tuple(k.strip().lower() for k in os.environ.get("LIMIT_KEY", "short,encode,link").split(",") if k.strip())
 
 BASE = "https://api-ssl.bitly.com/v4"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-\.]{20,}")
@@ -75,7 +77,7 @@ async def get_org_guid(session, token, user):
 
 def pick_main(limits):
     """Pick the short-link creation limit. Falls back to None if nothing matches."""
-    for key in ("short", "encode", "link"):
+    for key in KEYS:
         for item in limits:
             text = f"{item.get('name', '')} {item.get('description', '')}".lower()
             if (
@@ -157,14 +159,24 @@ def chunk_lines(lines, limit=3500):
     return chunks
 
 
-async def send_block(message, title, tokens):
-    """Send tokens one per line inside a code block (tap = copy all)."""
+def short_num(n):
+    """1000 -> 1k, 80000 -> 80k, 10 -> 10"""
+    if n >= 1000 and n % 100 == 0:
+        return f"{n / 1000:g}k"
+    return str(n)
+
+
+async def send_block(message, tokens, header=None, footer=None):
+    """Tokens one per line in a code block (tap = copy all). Optional header above, footer below."""
     if not tokens:
         return
     parts = chunk_lines(tokens)
     for n, part in enumerate(parts, 1):
-        head = title if len(parts) == 1 else f"{title} [{n}/{len(parts)}]"
-        await message.reply_text(f"{head}\n<pre>{chr(10).join(part)}</pre>", parse_mode=ParseMode.HTML)
+        text = f"{header}\n" if header else ""
+        text += f"<pre>{chr(10).join(part)}</pre>"
+        if footer and n == len(parts):
+            text += f"\n{footer}"
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
         await asyncio.sleep(0.5)
 
 
@@ -205,34 +217,45 @@ async def run_check(message, tokens):
     unknown = [r for r in valid if r["remaining"] is None]
     total_left = sum(r["remaining"] or 0 for r in valid)
 
-    main_tokens = [r["token"] for r in valid if r["remaining"] != 0]  # limit bachi hai ya unknown
     exhausted_tokens = [r["token"] for r in exhausted]
+    unknown_tokens = [r["token"] for r in unknown]
     error_tokens = [r["token"] for r in errors]
     invalid_tokens = [r["token"] for r in invalid]
     total_limit = sum(r["limit"] or 0 for r in valid)
 
-    await safe_edit(status, f"✅ Check complete — {len(results)} tokens")
+    # tokens that still have limit, grouped by their total limit (1000, 10, 5 ...)
+    groups = {}
+    for r in valid:
+        if r["remaining"] and r["remaining"] > 0:
+            groups.setdefault(r["limit"], []).append(r)
 
-    # 1) valid tokens, one per line (paste-ready)
-    await send_block(message, f"✅ Valid tokens ({len(main_tokens)})", main_tokens)
-
-    # 2) totals below the tokens
+    # short overview goes into the progress message
     summary = (
-        f"📊 Total limit: {total_limit}\n"
-        f"✅ Bachi hui: {total_left}\n"
-        f"⛔ Limit khatam: {len(exhausted)} tokens\n"
-        f"🟢 Valid: {len(valid)} | 🔴 Invalid: {len(invalid)}"
+        f"✅ Check complete — {len(results)} tokens\n"
+        f"🟢 Valid: {len(valid)} | 🔴 Invalid: {len(invalid)}\n"
+        f"📊 Total limit: {short_num(total_limit)} | Bachi: {total_left}\n"
+        f"⛔ Limit khatam: {len(exhausted)}"
     )
     if unknown:
-        summary += f"\n❔ Limit unknown: {len(unknown)} tokens"
+        summary += f"\n❔ Limit unknown: {len(unknown)}"
     if errors:
         summary += f"\n🟡 Error (dobara check karo): {len(errors)}"
-    await message.reply_text(summary)
+    await safe_edit(status, summary)
 
-    # 3) the rest, each in its own block
-    await send_block(message, f"⛔ Limit khatam ({len(exhausted_tokens)})", exhausted_tokens)
-    await send_block(message, f"🟡 Error — dobara check karo ({len(error_tokens)})", error_tokens)
-    await send_block(message, f"❌ Invalid tokens ({len(invalid_tokens)})", invalid_tokens)
+    # one message per limit group: tokens, then total limit below
+    for limit in sorted(groups, reverse=True):
+        grp = sorted(groups[limit], key=lambda r: r["remaining"], reverse=True)
+        left = sum(r["remaining"] for r in grp)
+        footer = (
+            f"Total limit: {short_num(limit * len(grp))} — each token {short_num(limit)} limit\n"
+            f"Bachi: {left}"
+        )
+        await send_block(message, [r["token"] for r in grp], footer=footer)
+
+    await send_block(message, exhausted_tokens, header="⛔ Limit khatam 👇🏻")
+    await send_block(message, unknown_tokens, header="❔ Valid, limit unknown 👇🏻")
+    await send_block(message, error_tokens, header="🟡 Error, dobara check karo 👇🏻")
+    await send_block(message, invalid_tokens, header="❌ Invalid token 👇🏻")
 
 
 async def delayed_run(user_id):
@@ -265,7 +288,7 @@ async def start(_, message: Message):
     await message.reply_text(
         "👋 Bitly Limit Checker\n\n"
         "Bitly tokens bhejo (har line me ek token) — text ya .txt file, 150-200 ek saath chalega.\n"
-        "Main text me reply dunga: valid tokens (line se, paste-ready), niche total limit + bachi hui limit, phir invalid tokens.\n\n"
+        "Reply text me milega: har limit group ka alag message (tokens line se, niche total limit + each token limit), last me invalid tokens.\n\n"
         "Debug: /raw <token> — us token ki saari plan limits dikhata hai."
     )
 
